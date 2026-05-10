@@ -62,8 +62,8 @@ class ZeroOrderOptimizer:
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 1e-3,
-        eps: float = 1e-3,
+        lr: float = 8e-4,
+        eps: float = 3e-4,
         perturbation_mode: str = "gaussian",
     ) -> None:
         self.model = model
@@ -136,6 +136,10 @@ class ZeroOrderOptimizer:
             u = u / norm
         return u
 
+    def _sample_spsa_direction(self, param: torch.Tensor) -> torch.Tensor:
+        # return +/- 1 
+        return torch.empty_like(param).bernoulli_(0.5).mul_(2.0).sub_(1.0)
+
     def _estimate_grad(
         self,
         loss_fn: Callable[[], float],
@@ -171,29 +175,42 @@ class ZeroOrderOptimizer:
         # ------------------------------------------------------------------
         # STUDENT: Replace or extend the gradient estimation below.
         # ------------------------------------------------------------------
-        grads: dict[str, torch.Tensor] = {}
+
+        # Used SPSA to reduce computation cost
+        grads = {name: torch.zeros_like(param) for name, param in params.items()}
+        n_dirs = 1
 
         with torch.no_grad():
-            for name, param in params.items():
-                u = self._sample_direction(param)
+            for d in range(n_dirs):
+                directions = {
+                    name: self._sample_spsa_direction(param) for name, param in params.items()
+                }
 
-                # f(x + eps * u)
-                param.data.add_(self.eps * u)
+                # f(x + eps * delta)
+                for name, param in params.items():
+                    param.add_(self.eps * directions[name])
                 f_plus = loss_fn()
 
-                # f(x - eps * u)  — restore then subtract
-                param.data.sub_(2.0 * self.eps * u)
+                # f(x - eps * delta)
+                for name, param in params.items():
+                    param.sub_(2.0 * self.eps * directions[name])
                 f_minus = loss_fn()
 
                 # Restore original value
-                param.data.add_(self.eps * u)
+                for name, param in params.items():
+                    param.add_(self.eps * directions[name])
 
-                grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * u
-                grads[name] = grad_estimate
+                scale = (f_plus - f_minus) / (2.0 * self.eps)
+                for name in params:
+                    grads[name].add_(scale * directions[name])
+
+            for name in grads:
+                grads[name].div_(n_dirs)
 
         return grads
         # ------------------------------------------------------------------
 
+    # I left plain SGD since it showed the best metrics (see Experiments section)
     def _update_params(
         self,
         params: dict[str, nn.Parameter],
